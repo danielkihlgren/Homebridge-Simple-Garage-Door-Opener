@@ -38,9 +38,7 @@ You don't need that much to get started. Just tell Simple Garage Door Opener whi
         "accessory": "SimpleGarageDoorOpener",
         "name": "SimpleGarageDoorOpener",
         "doorSwitchPin": 12,
-        "simulateTimeOpening": 15,
-        "simulateTimeOpen": 30,
-        "simulateTimeClosing": 15
+        "doorOpensInSeconds": 15
     }]
 ```
 
