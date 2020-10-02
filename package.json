@@ -1,6 +1,6 @@
 {
   "name": "homebridge-simple-garage-door-opener",
-  "version": "1.0.6",
+  "version": "1.1.0",
   "description": "Garage Door Opener plugin for Homebridge with auto-states",
   "author": "Daniel Reiser",
   "license": "MIT",

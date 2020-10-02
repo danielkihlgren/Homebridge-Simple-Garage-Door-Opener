@@ -2,11 +2,13 @@
 
 const rpio = require('rpio');
 
-var Service, Characteristic;
+var Service, Characteristic, CurrentDoorState, TargetDoorState;
 
 module.exports = (homebridge) => {
   Service = homebridge.hap.Service;
   Characteristic = homebridge.hap.Characteristic;
+  CurrentDoorState = Characteristic.CurrentDoorState;
+  TargetDoorState = Characteristic.TargetDoorState;
 
   homebridge.registerAccessory('homebridge-simple-garage-door-opener', 'SimpleGarageDoorOpener', SimpleGarageDoorOpener);
 };
@@ -17,7 +19,10 @@ class SimpleGarageDoorOpener {
     //get config values
     this.name = config['name'];
     this.doorSwitchPin = config['doorSwitchPin'] || 12;
+    this.doorClosedSensor = config['doorClosedSensor']; // || 23;
+    this.doorOpenSensor = config['doorOpenSensor']; // || 37;
     this.doorOpensInSeconds = config['doorOpensInSeconds'] || 15;
+    this.sensorPollTimeInms = config['sensorPollTimeInms'] || 1000;
 
     //initial setup
     this.log = log;
@@ -37,65 +42,147 @@ class SimpleGarageDoorOpener {
 
   setupGarageDoorOpenerService (service) {
     rpio.open(this.doorSwitchPin, rpio.OUTPUT, rpio.HIGH);
+    if (this.doorClosedSensor) {
+      rpio.open(this.doorClosedSensor, rpio.INPUT, rpio.PULL_UP);
+    }
+    if (this.doorOpenSensor) {
+      rpio.open(this.doorOpenSensor, rpio.INPUT, rpio.PULL_UP);
+    }
+    this.currentDoorState = service.getCharacteristic(CurrentDoorState);
+    this.targetDoorState = service.getCharacteristic(TargetDoorState);
+    this.obstructionDetected = service.getCharacteristic(Characteristic.ObstructionDetected)
 
-    this.service.setCharacteristic(Characteristic.TargetDoorState, Characteristic.TargetDoorState.CLOSED);
-    this.service.setCharacteristic(Characteristic.CurrentDoorState, Characteristic.CurrentDoorState.CLOSED);
+    this.setDoorStates(this.readDoorStateFromSensors())
 
-    service.getCharacteristic(Characteristic.TargetDoorState)
+    this.targetDoorState
       .on('set', (value, callback) => {
-        this.log('target.set: ' + value);
-        if (value === Characteristic.TargetDoorState.OPEN) {
-          switch (service.getCharacteristic(Characteristic.CurrentDoorState).value) {
-            case Characteristic.CurrentDoorState.CLOSED:
-              this.openGarageDoor(callback);
+        if (value === TargetDoorState.OPEN) {
+          this.log('target.set: OPEN');
+          switch (this.currentDoorState.value) {
+            case CurrentDoorState.CLOSED:
+              this.log('Opening the garage door, triggered from HomeKit.');
+              this.toggleDoor();
+              this.openGarageDoor();
               callback();
               break;
-            case Characteristic.CurrentDoorState.OPEN:
-              this.log('should never occur that it tries to open when open');
-              callback(new Error('Must wait until operation is finished'));
-              break;
             default:
-              callback(new Error('Must wait until operation is finished'));
+              callback();
               return;
           }
-        } else if (value === Characteristic.TargetDoorState.CLOSED) {
-          switch (service.getCharacteristic(Characteristic.CurrentDoorState).value) {
-            case Characteristic.CurrentDoorState.CLOSED:
-              this.log('should never occur that it tries to close when closed');
-              callback(new Error('Must wait until operation is finished'));
-              break;
-            case Characteristic.CurrentDoorState.OPEN:
-              this.closeGarageDoor(callback);
+        } else if (value === TargetDoorState.CLOSED) {
+          this.log('target.set: CLOSED');
+          switch (this.currentDoorState.value) {
+            case CurrentDoorState.OPEN:
+              this.log('Closing the garage door, triggered from HomeKit.');
+              this.toggleDoor();
+              this.closeGarageDoor();
               callback();
               break;
             default:
-              callback(new Error('Must wait until operation is finished'));
+              callback();
               return;
           }
         }
       });
+
+    if (this.doorOpenSensor || this.doorClosedSensor) {
+      setInterval(this.updateDoorStatesFromSensors.bind(this), this.sensorPollTimeInms);
+    }
+  }
+
+  setDoorStates(doorState) {
+    this.currentDoorState.setValue(doorState);
+    this.targetDoorState.setValue(doorState);
   }
 
   openGarageDoor () {
-    this.toggleDoor();
+    this.currentDoorState.setValue(CurrentDoorState.OPENING);
+    this.obstructionDetected.setValue(false);
 
-    this.log('Opening the garage door');
-    this.service.setCharacteristic(Characteristic.CurrentDoorState, Characteristic.CurrentDoorState.OPENING);
-    setTimeout(() => {
-      this.log('Opened the garage door');
-      this.service.setCharacteristic(Characteristic.CurrentDoorState, Characteristic.CurrentDoorState.OPEN);
+    this.doorTimeout = setTimeout(() => {
+      if (!this.doorOpenSensor) {
+        this.log('Garage door is now assumed to be open since no open door sensor is present.');
+        this.currentDoorState.setValue(CurrentDoorState.OPEN);
+      } else {
+        this.log('Garage door is identified to be stopped while opening since no open door sensor verified open state.');
+        this.currentDoorState.setValue(CurrentDoorState.STOPPED);
+        this.obstructionDetected.setValue(true);
+      }
     }, this.doorOpensInSeconds * 1000);
   }
 
   closeGarageDoor () {
-    this.toggleDoor();
+    this.currentDoorState.setValue(CurrentDoorState.CLOSING);
+    this.obstructionDetected.setValue(false);
 
-    this.log('Closing the garage door');
-    this.service.setCharacteristic(Characteristic.CurrentDoorState, Characteristic.CurrentDoorState.CLOSING);
-    setTimeout(() => {
-      this.log('Closed the garage door');
-      this.service.setCharacteristic(Characteristic.CurrentDoorState, Characteristic.CurrentDoorState.CLOSED);
+    this.doorTimeout = setTimeout(() => {
+      if (!this.doorClosedSensor) {
+        this.log('Garage door is now assumed to be closed since no close door sensor is present.');
+        this.currentDoorState.setValue(CurrentDoorState.CLOSED);
+      } else {
+        this.log('Garage door is identified to be stopped while closing since no closed door sensor verified closed state.');
+        this.currentDoorState.setValue(CurrentDoorState.STOPPED);
+        this.obstructionDetected.setValue(true);
+      }
     }, this.doorOpensInSeconds * 1000);
+  }
+
+  updateDoorStatesFromSensors() {
+    if (this.doorOpenSensor && (rpio.read(this.doorOpenSensor) === rpio.LOW)) {
+      if (this.currentDoorState.value !== CurrentDoorState.OPEN) {
+        this.log('Sensor identified that garage door is open.');
+        this.maybeClearDoorTimeout();
+        this.currentDoorState.setValue(CurrentDoorState.OPEN);
+        this.targetDoorState.setValue(TargetDoorState.OPEN);
+        this.obstructionDetected.setValue(false);
+      }
+    } else if (this.doorClosedSensor && (rpio.read(this.doorClosedSensor) === rpio.LOW)) {
+      if (this.currentDoorState.value !== CurrentDoorState.CLOSED) {
+        this.log('Sensor identified that garage door is closed.');
+        this.maybeClearDoorTimeout();
+        this.currentDoorState.setValue(CurrentDoorState.CLOSED);
+        this.targetDoorState.setValue(TargetDoorState.CLOSED);
+        this.obstructionDetected.setValue(false);
+      }
+    } else if (this.doorClosedSensor && (this.currentDoorState.value === CurrentDoorState.CLOSED)) {
+      if (this.targetDoorState.value !== TargetDoorState.OPEN) {
+        this.log('Closed door sensor identified that garage door is opening.');
+        this.openGarageDoor();
+        this.targetDoorState.setValue(TargetDoorState.OPEN);
+      }
+    } else if (this.doorOpenSensor && (this.currentDoorState.value === CurrentDoorState.OPEN)) {
+      if (this.targetDoorState.value !== TargetDoorState.CLOSED) {
+        this.log('Open door sensor identified that garage door is closing.');
+        this.closeGarageDoor();
+        this.targetDoorState.setValue(TargetDoorState.CLOSED);
+      }
+    }
+  }
+
+  maybeClearDoorTimeout() {
+    if (this.doorTimeout) {
+      clearTimeout(this.doorTimeout);
+      this.doorTimeout = undefined;
+    }
+  }
+
+  readDoorStateFromSensors() {
+    if (this.doorOpenSensor && (rpio.read(this.doorOpenSensor) === rpio.LOW)) {
+      this.log('Initial door state is identified to be open by open door sensor.');
+      return CurrentDoorState.OPEN;
+    } else if (this.doorClosedSensor && (rpio.read(this.doorClosedSensor) === rpio.LOW)) {
+      this.log('Initial door state is identified to be closed by closed door sensor.');
+      return CurrentDoorState.CLOSED;
+    } else if (this.doorOpenSensor && this.doorOpenSensor) {
+      this.log('Initial door state is assumed to be stopped since no sensor could identify it\'s state.');
+      return CurrentDoorState.STOPPED;
+    } else if (this.doorClosedSensor) {
+      this.log('Initial door state is assumed to be open since it was not identified to be closed by closed door sensor.');
+      return CurrentDoorState.OPEN;
+    } else {
+      this.log('Initial door state is assumed to be closed since it was not identified to be open by open door sensor.');
+      return CurrentDoorState.CLOSED;
+    }
   }
 
   toggleDoor() {
@@ -103,6 +190,4 @@ class SimpleGarageDoorOpener {
     rpio.sleep(0.5);
     rpio.write(this.doorSwitchPin, rpio.HIGH);
   }
-
-
 }
